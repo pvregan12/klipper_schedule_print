@@ -111,4 +111,5 @@ web UI, and a Moonraker-driven "update" is just a `git pull` in
 next restart with no extra steps.
 
 ## License
-GPL 3
+
+This project is licensed under the GNU General Public License v3.0 - see the [LICENSE](LICENSE) file for details.
