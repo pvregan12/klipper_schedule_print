@@ -12,6 +12,8 @@
 #   home_gcode: G28
 #   clean_nozzle_gcode: CLEAN_NOZZLE
 #   print_start_gcode: PRINT_START
+#   menu_max_files: 12
+#   menu_presets: Now=2s,+1 hour=1h,+3 hours=3h,+6 hours=6h,Tonight 10pm=22:00,Tomorrow 6am=06:00
 #
 # Usage:
 #   SCHEDULE_PRINT FILE=my_part.gcode DELAY=90m
@@ -20,6 +22,12 @@
 #   SCHEDULE_PRINT FILE=my_part.gcode AT="2026-08-26 06:00"
 #   SCHEDULE_PRINT_CANCEL
 #   QUERY_SCHEDULED_PRINT
+#
+#   SCHEDULE_PRINT_MENU
+#     Pops up a Mainsail/Fluidd prompt listing recent SD card files as
+#     buttons. Tapping one opens a second prompt with fixed time
+#     presets (from menu_presets); tapping a preset calls SCHEDULE_PRINT
+#     for you. No typing required.
 #
 # When the scheduled time arrives, the module runs, in order:
 #   home_gcode -> clean_nozzle_gcode -> print_start_gcode -> the print file
@@ -37,8 +45,15 @@
 #     either give it defaults or set print_start_gcode in the config to
 #     include them, e.g.:
 #       print_start_gcode: PRINT_START BED_TEMP=60 EXTRUDER_TEMP=210
+#   - SCHEDULE_PRINT_MENU relies on the "prompt" support built into
+#     Mainsail/Fluidd (Klipper's [respond] module must be enabled --
+#     it is by default). Filenames containing a literal double-quote
+#     character or a pipe (|) character will have those characters
+#     stripped when displayed/used, since neither the gcode parser nor
+#     the prompt protocol has an escape sequence for them.
 
 import logging
+import os
 import re
 from datetime import datetime, timedelta
 
@@ -55,6 +70,12 @@ class ScheduledPrint:
         self.print_start_gcode = config.get('print_start_gcode',
                                              'PRINT_START')
 
+        self.menu_max_files = config.getint('menu_max_files', 12, minval=1)
+        self.menu_presets_raw = config.get(
+            'menu_presets',
+            'Now=2s,+1 hour=1h,+3 hours=3h,+6 hours=6h,'
+            'Tonight 10pm=22:00,Tomorrow 6am=06:00')
+
         self.timer = None
         self.scheduled_filename = None
         self.scheduled_time = None  # wall-clock datetime, for reporting
@@ -68,6 +89,12 @@ class ScheduledPrint:
         self.gcode.register_command(
             'QUERY_SCHEDULED_PRINT', self.cmd_QUERY_SCHEDULED_PRINT,
             desc=self.cmd_QUERY_SCHEDULED_PRINT_help)
+        self.gcode.register_command(
+            'SCHEDULE_PRINT_MENU', self.cmd_SCHEDULE_PRINT_MENU,
+            desc=self.cmd_SCHEDULE_PRINT_MENU_help)
+        self.gcode.register_command(
+            'SCHEDULE_PRINT_MENU_TIME', self.cmd_SCHEDULE_PRINT_MENU_TIME,
+            desc=self.cmd_SCHEDULE_PRINT_MENU_TIME_help)
 
     # ---------------- time parsing helpers ----------------
 
@@ -125,7 +152,7 @@ class ScheduledPrint:
             "Could not parse AT value '%s'. Use HH:MM, HH:MM:SS, "
             "'YYYY-MM-DD HH:MM', or 'YYYY-MM-DD HH:MM:SS'." % (at_str,))
 
-    # ---------------- command handlers ----------------
+    # ---------------- command handlers: core scheduling ----------------
 
     cmd_SCHEDULE_PRINT_help = (
         "Schedule a print: SCHEDULE_PRINT FILE=<name> DELAY=<duration> "
@@ -140,9 +167,7 @@ class ScheduledPrint:
             raise gcmd.error(
                 "SCHEDULE_PRINT requires exactly one of DELAY= or AT=")
 
-        sdcard = self.printer.lookup_object('virtual_sdcard')
-        known_files = [f[0] if isinstance(f, (tuple, list)) else f
-                       for f in sdcard.get_file_list()]
+        known_files = self._get_all_files()
         if filename not in known_files:
             raise gcmd.error(
                 "File '%s' not found on the virtual SD card. Check the "
@@ -193,7 +218,119 @@ class ScheduledPrint:
                 self.scheduled_time.strftime('%Y-%m-%d %H:%M:%S'),
                 self._format_delay(remaining)))
 
+    # ---------------- command handlers: click-to-schedule menu ----------------
+
+    cmd_SCHEDULE_PRINT_MENU_help = (
+        "Show a Mainsail/Fluidd prompt to pick a file to schedule")
+
+    def cmd_SCHEDULE_PRINT_MENU(self, gcmd):
+        files = self._get_recent_files(self.menu_max_files)
+        if not files:
+            gcmd.respond_info("No files found on the SD card")
+            return
+
+        lines = [
+            '// action:prompt_begin Schedule a Print',
+            '// action:prompt_text Choose a file (most recent first):',
+        ]
+        for fname in files:
+            label = self._display_label(fname)
+            command = 'SCHEDULE_PRINT_MENU_TIME FILE=%s' % (
+                self._quote(fname),)
+            lines.append('// action:prompt_button %s|%s' % (label, command))
+        lines.append(
+            '// action:prompt_footer_button Cancel|RESPOND '
+            'MSG="Schedule cancelled"|secondary')
+        lines.append('// action:prompt_show')
+        for line in lines:
+            self.gcode.respond_raw(line)
+
+    cmd_SCHEDULE_PRINT_MENU_TIME_help = (
+        "Show a prompt to pick when the given FILE should print "
+        "(called by SCHEDULE_PRINT_MENU)")
+
+    def cmd_SCHEDULE_PRINT_MENU_TIME(self, gcmd):
+        filename = gcmd.get('FILE')
+        presets = self._parse_menu_presets()
+        if not presets:
+            raise gcmd.error(
+                "menu_presets in [scheduled_print] has no valid entries")
+
+        lines = [
+            '// action:prompt_begin Schedule Print',
+            '// action:prompt_text When should %s start?' % (
+                self._display_label(filename),),
+        ]
+        for label, param in presets:
+            command = 'SCHEDULE_PRINT FILE=%s %s' % (
+                self._quote(filename), param)
+            lines.append('// action:prompt_button %s|%s' % (label, command))
+        lines.append(
+            '// action:prompt_footer_button Cancel|RESPOND '
+            'MSG="Schedule cancelled"|secondary')
+        lines.append('// action:prompt_show')
+        for line in lines:
+            self.gcode.respond_raw(line)
+
+    def _parse_menu_presets(self):
+        presets = []
+        for item in self.menu_presets_raw.split(','):
+            item = item.strip()
+            if not item:
+                continue
+            if '=' not in item:
+                logging.warning(
+                    "scheduled_print: ignoring malformed menu_presets "
+                    "entry '%s' (expected Label=Value)", item)
+                continue
+            label, value = item.split('=', 1)
+            label = label.strip()
+            value = value.strip()
+            if not label or not value:
+                continue
+            if ':' in value:
+                param = 'AT=%s' % (self._quote(value),)
+            else:
+                param = 'DELAY=%s' % (self._quote(value),)
+            presets.append((label, param))
+        return presets
+
     # ---------------- internals ----------------
+
+    def _get_all_files(self):
+        sdcard = self.printer.lookup_object('virtual_sdcard')
+        return [f[0] if isinstance(f, (tuple, list)) else f
+                for f in sdcard.get_file_list()]
+
+    def _get_recent_files(self, limit):
+        sdcard = self.printer.lookup_object('virtual_sdcard')
+        files = self._get_all_files()
+        try:
+            sdcard_dir = sdcard.sdcard_dirname
+            files.sort(
+                key=lambda fn: os.path.getmtime(os.path.join(sdcard_dir, fn)),
+                reverse=True)
+        except Exception:
+            logging.exception(
+                "scheduled_print: could not sort files by modified time, "
+                "falling back to alphabetical order")
+        return files[:limit]
+
+    @staticmethod
+    def _display_label(value, max_len=40):
+        # Buttons/text use '|' as a field separator and have no escape
+        # for it, so strip it out of anything we display.
+        clean = value.replace('|', '')
+        if len(clean) > max_len:
+            clean = clean[:max_len - 3] + '...'
+        return clean
+
+    @staticmethod
+    def _quote(value):
+        # Wrap a value for use as a quoted gcode parameter. Klipper's
+        # parser has no escape sequence for a literal double quote, so
+        # strip any that appear rather than risk a broken command.
+        return '"%s"' % (value.replace('"', "'").replace('|', ''),)
 
     def _cancel_existing(self):
         if self.timer is not None:
