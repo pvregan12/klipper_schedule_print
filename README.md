@@ -8,7 +8,7 @@ after a delay, running a configurable warm-up sequence
 
 ```bash
 cd ~
-git clone https://github.com/pvregan12/klipper_schedule_print.git
+git clone https://github.com/<your-username>/scheduled_print.git
 cd scheduled_print
 ./install.sh
 ```
@@ -34,11 +34,14 @@ Add to `printer.cfg`:
 #home_gcode: G28
 #clean_nozzle_gcode: CLEAN_NOZZLE
 #print_start_gcode: PRINT_START
+#menu_max_files: 12
+#menu_presets: Now=2s,+1 hour=1h,+3 hours=3h,+6 hours=6h,Tonight 10pm=22:00,Tomorrow 6am=06:00
 ```
 
-All three options are optional; the values above are the defaults.
-Set any of them to an empty string to skip that step, e.g. if your
-`PRINT_START` macro already handles homing and nozzle cleaning:
+All options are optional; the values above are the defaults.
+Set `home_gcode`/`clean_nozzle_gcode` to an empty string to skip
+that step, e.g. if your `PRINT_START` macro already handles homing
+and nozzle cleaning:
 
 ```ini
 [scheduled_print]
@@ -46,7 +49,15 @@ home_gcode:
 clean_nozzle_gcode:
 ```
 
+`menu_max_files` caps how many files `SCHEDULE_PRINT_MENU` lists
+(most recently modified first). `menu_presets` is a comma-separated
+list of `Label=Value` pairs used by `SCHEDULE_PRINT_MENU_TIME` --
+each `Value` is treated as a clock time (`AT=`) if it contains a
+`:`, otherwise as a duration (`DELAY=`).
+
 ## Usage
+
+### Command line / console
 
 ```
 SCHEDULE_PRINT FILE=my_part.gcode DELAY=90m
@@ -70,6 +81,24 @@ that time has already passed today.
 When the scheduled time arrives, `home_gcode`, then
 `clean_nozzle_gcode`, then `print_start_gcode` are run in order,
 followed by `SDCARD_PRINT_FILE FILENAME=<file>`.
+
+### Click-to-schedule menu (Mainsail / Fluidd)
+
+Run `SCHEDULE_PRINT_MENU` (from the console, or add it as a macro
+button in Mainsail's UI under Interface Settings &rarr; Macros) to
+get a tap-through picker instead of typing a filename:
+
+1. A prompt lists your most recent SD card files as buttons.
+2. Tapping one opens a second prompt with the time presets from
+   `menu_presets`.
+3. Tapping a preset calls `SCHEDULE_PRINT` for you.
+
+This relies on Klipper's built-in "prompt" protocol, which needs
+the `[respond]` module enabled (it is enabled by default; add an
+empty `[respond]` section to `printer.cfg` if yours doesn't have
+one already). Filenames or preset labels containing a literal `"`
+or `|` character have that character stripped, since neither the
+gcode parser nor the prompt protocol has a way to escape it.
 
 ## Caveats
 
